@@ -1,6 +1,7 @@
 // Fast CSV reader: byte-equivalent semantics to the reference (baselines/csv-reader).
-// Char-code scanner with a fast path for ordinary characters, slice-based field
-// building, and no per-field result objects (field end state lives in module vars).
+// Fields are found with native indexOf over cached next-',' / LF / CR / '"'
+// positions and sliced straight from the input; char-by-char scanning is kept only
+// for stray CRs. No per-field result objects (field end state lives in module vars).
 
 const CH_COMMA = 44;
 const CH_QUOTE = 34;
@@ -27,8 +28,9 @@ function fail(code) {
   errors.push({ code, line: recordLine, row: recordRow });
 }
 
-// Unquoted field starting at pos, appended to prefix `value`.
-function readUnquoted(value) {
+// Char-by-char unquoted reader (used when a CR that is not a CRLF ending may be
+// in the field). Unquoted field starting at pos, appended to prefix `value`.
+function readUnquotedSlow(value) {
   let a = 0;
   let i = pos;
   let seg = i;
@@ -68,6 +70,40 @@ function readUnquoted(value) {
   return value;
 }
 
+// Unquoted field starting at pos, appended to prefix `value`. Jumps to the next
+// ',' / LF with cached indexOf positions; falls back to the char loop only when a
+// CR other than a CRLF line ending sits inside the field.
+function readUnquoted(value) {
+  const p = pos;
+  if (nextComma < p) { nextComma = text.indexOf(',', p); if (nextComma < 0) nextComma = n; }
+  if (nextLF < p) { nextLF = text.indexOf('\n', p); if (nextLF < 0) nextLF = n; }
+  if (nextCR < p) { nextCR = text.indexOf('\r', p); if (nextCR < 0) nextCR = n; }
+  if (nextComma < nextLF) {
+    const e = nextComma;
+    if (nextCR < e) return readUnquotedSlow(value);
+    if (e > p) value += text.slice(p, e);
+    pos = e + 1;
+    ended = 0; added = e - p;
+    return value;
+  }
+  const e = nextLF;
+  if (nextCR < e) {
+    if (e >= n || nextCR + 1 !== e) return readUnquotedSlow(value);
+    // CRLF line ending
+    const c = nextCR;
+    if (c > p) value += text.slice(p, c);
+    pos = e + 1;
+    line++;
+    ended = 1; added = c - p;
+    return value;
+  }
+  if (e > p) value += text.slice(p, e);
+  added = e - p;
+  if (e < n) { pos = e + 1; line++; ended = 1; }
+  else { pos = n; ended = 2; }
+  return value;
+}
+
 // After a closing quote at pos-1: decide how the field ends.
 function afterClose(value) {
   if (pos >= n) { ended = 2; added = 0; return value; }
@@ -83,45 +119,79 @@ function afterClose(value) {
   return v;
 }
 
-// Quoted field starting at pos (text[pos] === '"').
+// Quoted field starting at pos (text[pos] === '"'). Jumps between quotes with
+// indexOf, counting LFs via the cached LF position; a CR inside the field (which
+// must become an LF) sends the rest of the scan to the char loop.
 function readQuoted() {
   const open = pos;
   const openLine = line;
   let value = '';
   let i = open + 1;
+  for (;;) {
+    if (nextQuote < i) { nextQuote = text.indexOf('"', i); if (nextQuote < 0) nextQuote = n; }
+    const q = nextQuote;
+    if (q >= n) break; // unterminated
+    if (nextCR < i) { nextCR = text.indexOf('\r', i); if (nextCR < 0) nextCR = n; }
+    if (nextCR < q) return quotedSlow(i, value, open, openLine);
+    if (nextLF < i) { nextLF = text.indexOf('\n', i); if (nextLF < 0) nextLF = n; }
+    while (nextLF < q) {
+      line++;
+      nextLF = text.indexOf('\n', nextLF + 1);
+      if (nextLF < 0) nextLF = n;
+    }
+    if (text.charCodeAt(q + 1) === CH_QUOTE) {
+      // doubled quote: one literal quote
+      value += text.slice(i, q + 1);
+      i = q + 2;
+      continue;
+    }
+    // closing quote
+    if (q > i) value += text.slice(i, q);
+    pos = q + 1;
+    return afterClose(value);
+  }
+  return unterminated(open, openLine);
+}
+
+function unterminated(open, openLine) {
+  // reread from after the quote as unquoted text; the scan moved the cached
+  // positions past pos, so drop them
+  pos = open + 1;
+  nextQuote = -1; nextLF = -1; nextCR = -1; nextComma = -1;
+  line = openLine;
+  fail('unterminated_quote');
+  return readUnquoted('"');
+}
+
+// Char-by-char quoted scan from i (inside the quotes), appending to value.
+function quotedSlow(i, value, open, openLine) {
   let seg = i;
   while (i < n) {
     const c = text.charCodeAt(i);
     if (c > CH_QUOTE || (c !== CH_QUOTE && c !== CH_LF && c !== CH_CR)) { i++; continue; }
     if (c === CH_QUOTE) {
       if (text.charCodeAt(i + 1) === CH_QUOTE) {
-        // doubled quote: one literal quote
         value += text.slice(seg, i + 1);
         i += 2;
         seg = i;
         continue;
       }
-      // closing quote
       if (i > seg) value += text.slice(seg, i);
       pos = i + 1;
       return afterClose(value);
     }
     if (c === CH_CR) {
+      // CR or CRLF inside quotes: kept as one LF
       value += text.slice(seg, i) + '\n';
       i += text.charCodeAt(i + 1) === CH_LF ? 2 : 1;
       seg = i;
       line++;
       continue;
     }
-    // LF
     i++;
     line++;
   }
-  // unterminated: reread from after the quote as unquoted text
-  pos = open + 1;
-  line = openLine;
-  fail('unterminated_quote');
-  return readUnquoted('"');
+  return unterminated(open, openLine);
 }
 
 export function run(input) {
