@@ -1,4 +1,5 @@
 // Fast CSV reader: byte-equivalent semantics to the reference (baselines/csv-reader).
+// Runs of clean lines (no '"', no stray CR) are cut with native String.split.
 // Fields are found with native indexOf over cached next-',' / LF / CR / '"'
 // positions and sliced straight from the input; char-by-char scanning is kept only
 // for stray CRs. No per-field result objects (field end state lives in module vars).
@@ -222,6 +223,54 @@ export function run(input) {
       else break;
     }
     if (pos >= n) break;
+
+    // Block fast path: a run of whole lines holding no '"' and no CR other than
+    // CRLF endings is cut with two native splits (lines at LF, fields at ',')
+    // instead of per-field scans.
+    if (nextQuote < pos) { nextQuote = text.indexOf('"', pos); if (nextQuote < 0) nextQuote = n; }
+    if (nextCR < pos) { nextCR = text.indexOf('\r', pos); if (nextCR < 0) nextCR = n; }
+    // CRs that are CRLF line endings are allowed in the block; it stops at the
+    // first '"' or stray CR.
+    let stop = nextQuote;
+    let crlf = false;
+    let c = nextCR;
+    while (c < stop) {
+      if (text.charCodeAt(c + 1) !== CH_LF) { stop = c; break; }
+      crlf = true;
+      c = text.indexOf('\r', c + 2);
+      if (c < 0) c = n;
+    }
+    nextCR = c;
+    if (nextLF < pos) { nextLF = text.indexOf('\n', pos); if (nextLF < 0) nextLF = n; }
+    // worth it only for two or more whole lines and >= 1 KiB before `stop`
+    // (short runs are cheaper on the per-line path below)
+    const blockEnd = nextLF >= stop ? pos : stop >= n ? n : text.lastIndexOf('\n', stop - 1) + 1;
+    if (blockEnd > nextLF + 1 && blockEnd - pos >= 1024) {
+      const lines = text.slice(pos, blockEnd).split('\n');
+      const cnt = lines.length;
+      let ln = line;
+      for (let j = 0; j < cnt; j++, ln++) {
+        let L = lines[j];
+        if (crlf && L.length > 0 && L.charCodeAt(L.length - 1) === CH_CR) L = L.slice(0, -1);
+        if (L === '') continue;
+        const fields = L.split(',');
+        if (width < 0) width = fields.length;
+        if (header && columns === null) { columns = fields; continue; }
+        const len = fields.length;
+        if (len < width) {
+          errs.push({ code: 'short_row', line: ln, row: rows.length, fields: len });
+          while (fields.length < width) fields.push('');
+        } else if (len > width) {
+          const e = { code: 'long_row', line: ln, row: rows.length };
+          errs.push(e);
+          e.extra = fields.splice(width);
+        }
+        rows.push(fields);
+      }
+      line = ln - 1;
+      pos = blockEnd;
+      continue;
+    }
 
     recordLine = line;
     recordRow = header && columns === null ? null : rows.length;
